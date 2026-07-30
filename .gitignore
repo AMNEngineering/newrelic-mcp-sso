@@ -1,0 +1,17 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/settings.json
+.vscode/*.log
+.idea/
+
+# Local session work
+.claude-local/
+.claude-runtime/
+transient/
+
+# Backups from install-time
+*.bak
+*.bak-*
