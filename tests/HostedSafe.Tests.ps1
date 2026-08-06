@@ -162,7 +162,11 @@ Describe 'PowerShell Copilot installer' {
         & chmod 644 $copilotConfig
         $LASTEXITCODE | Should -Be 0
 
-        $checkOutput = (& $script:PowerShellInstaller -Target Copilot -Check 6>&1) | Out-String
+        $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop |
+            Select-Object -First 1).Source
+        $checkOutput = (& $pwsh -NoProfile -File $script:PowerShellInstaller `
+            -Target Copilot -Check 2>&1) | Out-String
+        $LASTEXITCODE | Should -Not -Be 0
         $checkOutput | Should -Match 'permissions are not user-only'
         [int]([System.IO.File]::GetUnixFileMode($copilotConfig)) | Should -Be 420
 

@@ -269,7 +269,7 @@ function Merge-McpEntry {
                 Write-Ok "$Label is already configured securely in $ConfigFile"
             }
             else {
-                Write-Warn2 "$Label is configured, but $ConfigFile permissions are not user-only; install would restrict them to mode 0600."
+                throw "$Label is configured, but $ConfigFile permissions are not user-only; install would restrict them to mode 0600."
             }
             return
         }
