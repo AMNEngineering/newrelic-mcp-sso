@@ -109,10 +109,80 @@ function Set-SecureFilePermissions {
         return
     }
 
-    $chmod = Get-Command chmod -CommandType Application -ErrorAction Stop
+    $chmod = Get-Command chmod -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1
     & $chmod.Source 600 $Path
     if ($LASTEXITCODE -ne 0) {
         throw "failed to restrict permissions on $Path"
+    }
+}
+
+function Write-SecureFileBytes {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [System.Security.AccessControl.FileSecurity]$WindowsAcl
+    )
+
+    $stream = $null
+    $createdFile = $false
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        $createdFile = $true
+        $stream.Dispose()
+        $stream = $null
+
+        # Secure the empty file before any potentially sensitive config is written.
+        Set-SecureFilePermissions -Path $Path -WindowsAcl $WindowsAcl
+        [System.IO.File]::WriteAllBytes($Path, $Bytes)
+        Set-SecureFilePermissions -Path $Path -WindowsAcl $WindowsAcl
+    }
+    catch {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        if ($createdFile) {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
+}
+
+function Restore-SecureFileBytes {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [System.Security.AccessControl.FileSecurity]$WindowsAcl
+    )
+
+    $restoreFile = "$Path.restore-$([guid]::NewGuid().ToString('N'))"
+    $displacedFile = "$Path.displaced-$([guid]::NewGuid().ToString('N'))"
+    try {
+        Write-SecureFileBytes -Path $restoreFile -Bytes $Bytes -WindowsAcl $WindowsAcl
+        if (Test-Path -LiteralPath $Path) {
+            [System.IO.File]::Replace($restoreFile, $Path, $displacedFile)
+            Remove-Item -LiteralPath $displacedFile -Force
+        }
+        else {
+            Move-Item -LiteralPath $restoreFile -Destination $Path
+        }
+    }
+    catch {
+        Remove-Item -LiteralPath $restoreFile -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $displacedFile) {
+            if (Test-Path -LiteralPath $Path) {
+                Remove-Item -LiteralPath $displacedFile -Force -ErrorAction SilentlyContinue
+            }
+            else {
+                Move-Item -LiteralPath $displacedFile -Destination $Path
+            }
+        }
+        throw
     }
 }
 
@@ -189,9 +259,9 @@ function Merge-McpEntry {
     }
 
     if ($hadFile) {
-        $backup = "$ConfigFile.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-        Copy-Item -LiteralPath $ConfigFile -Destination $backup -Force
-        Set-SecureFilePermissions -Path $backup -WindowsAcl $originalWindowsAcl
+        $backup = "$ConfigFile.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss-fff')"
+        $backupBytes = [System.IO.File]::ReadAllBytes($ConfigFile)
+        Write-SecureFileBytes -Path $backup -Bytes $backupBytes -WindowsAcl $originalWindowsAcl
         Write-Ok "backed up existing config -> $backup"
     }
 
@@ -208,8 +278,7 @@ function Merge-McpEntry {
     try {
         $json = $existing | ConvertTo-Json -Depth 20
         $bytes = [System.Text.UTF8Encoding]::new($true).GetBytes($json)
-        [System.IO.File]::WriteAllBytes($tempFile, $bytes)
-        Set-SecureFilePermissions -Path $tempFile -WindowsAcl $originalWindowsAcl
+        Write-SecureFileBytes -Path $tempFile -Bytes $bytes -WindowsAcl $originalWindowsAcl
         Get-Content -Raw -LiteralPath $tempFile | ConvertFrom-Json -ErrorAction Stop | Out-Null
         Move-Item -LiteralPath $tempFile -Destination $ConfigFile -Force
         $configMoved = $true
@@ -217,12 +286,15 @@ function Merge-McpEntry {
     }
     catch {
         Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
-        if ($backup) {
-            Copy-Item -LiteralPath $backup -Destination $ConfigFile -Force
-            Set-SecureFilePermissions -Path $ConfigFile -WindowsAcl $originalWindowsAcl
+        if ($backup -and $configMoved) {
+            $restoreBytes = [System.IO.File]::ReadAllBytes($backup)
+            Restore-SecureFileBytes -Path $ConfigFile -Bytes $restoreBytes -WindowsAcl $originalWindowsAcl
         }
         elseif ($configMoved) {
             Remove-Item -LiteralPath $ConfigFile -Force -ErrorAction SilentlyContinue
+        }
+        if ($backup) {
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
         }
         throw
     }

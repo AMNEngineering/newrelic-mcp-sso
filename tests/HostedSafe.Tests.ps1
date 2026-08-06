@@ -158,6 +158,88 @@ Describe 'PowerShell Copilot installer' {
         }
     }
 
+    It 'removes empty artifacts when Unix permission hardening fails' {
+        if ($script:IsWindowsHost) {
+            Set-ItResult -Skipped -Because 'This failure path uses the Unix chmod implementation'
+            return
+        }
+
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        $copilotConfig = Join-Path $script:CopilotHome 'mcp-config.json'
+        '{"mcpServers":{"other":{"headers":{"Authorization":"preserve-me"}}}}' |
+            Set-Content -LiteralPath $copilotConfig -Encoding utf8
+        $originalContent = Get-Content -Raw -LiteralPath $copilotConfig
+
+        $realChmod = (Get-Command chmod -CommandType Application -ErrorAction Stop).Source
+        $fakeBin = Join-Path $script:TempRoot 'fake-bin'
+        $fakeChmod = Join-Path $fakeBin 'chmod'
+        New-Item -ItemType Directory -Path $fakeBin -Force | Out-Null
+        "#!/bin/sh`nexit 1`n" | Set-Content -LiteralPath $fakeChmod -Encoding utf8
+        & $realChmod +x $fakeChmod
+        $LASTEXITCODE | Should -Be 0
+
+        $previousPath = $env:PATH
+        try {
+            $env:PATH = "$fakeBin$([System.IO.Path]::PathSeparator)$previousPath"
+            { & $script:PowerShellInstaller -Target Copilot -Force } |
+                Should -Throw '*failed to restrict permissions*'
+        }
+        finally {
+            $env:PATH = $previousPath
+        }
+
+        (Get-Content -Raw -LiteralPath $copilotConfig) | Should -Be $originalContent
+        @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.bak-*').Count |
+            Should -Be 0
+        @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.tmp-*').Count |
+            Should -Be 0
+    }
+
+    It 'atomically restores the live Unix config when final hardening fails' {
+        if ($script:IsWindowsHost) {
+            Set-ItResult -Skipped -Because 'This failure path uses the Unix chmod implementation'
+            return
+        }
+
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        $copilotConfig = Join-Path $script:CopilotHome 'mcp-config.json'
+        '{"mcpServers":{"other":{"headers":{"Authorization":"restore-me"}}}}' |
+            Set-Content -LiteralPath $copilotConfig -Encoding utf8
+        $originalContent = Get-Content -Raw -LiteralPath $copilotConfig
+
+        $realChmod = (Get-Command chmod -CommandType Application -ErrorAction Stop).Source
+        $fakeBin = Join-Path $script:TempRoot 'fake-bin'
+        $fakeChmod = Join-Path $fakeBin 'chmod'
+        New-Item -ItemType Directory -Path $fakeBin -Force | Out-Null
+        @"
+#!/bin/sh
+if [ "`$(basename "`$2")" = "mcp-config.json" ]; then
+  exit 1
+fi
+exec "$realChmod" "`$@"
+"@ | Set-Content -LiteralPath $fakeChmod -Encoding utf8
+        & $realChmod +x $fakeChmod
+        $LASTEXITCODE | Should -Be 0
+
+        $previousPath = $env:PATH
+        try {
+            $env:PATH = "$fakeBin$([System.IO.Path]::PathSeparator)$previousPath"
+            { & $script:PowerShellInstaller -Target Copilot -Force } |
+                Should -Throw '*failed to restrict permissions*'
+        }
+        finally {
+            $env:PATH = $previousPath
+        }
+
+        Test-Path -LiteralPath $copilotConfig | Should -BeTrue
+        (Get-Content -Raw -LiteralPath $copilotConfig) | Should -Be $originalContent
+        [int]([System.IO.File]::GetUnixFileMode($copilotConfig)) | Should -Be 384
+        @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.bak-*').Count |
+            Should -Be 0
+        @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.restore-*').Count |
+            Should -Be 0
+    }
+
     It 'refuses to replace a non-object MCP section' {
         New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
         '{"mcpServers":"preserve-me"}' |
