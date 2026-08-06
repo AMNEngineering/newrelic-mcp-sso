@@ -190,10 +190,27 @@ function Test-SecureWindowsAcl {
         'S-1-5-32-545'   # BUILTIN\Users
     )
     $genericRead = [long]2147483648
+    $genericWrite = [long]1073741824
     $genericAll = [long]268435456
-    $readMask = [long][System.Security.AccessControl.FileSystemRights]::ReadData -bor
-        $genericRead -bor $genericAll
+    $sensitiveAccessMask = (
+        [long][System.Security.AccessControl.FileSystemRights]::ReadData -bor
+        [long][System.Security.AccessControl.FileSystemRights]::WriteData -bor
+        [long][System.Security.AccessControl.FileSystemRights]::AppendData -bor
+        [long][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [long][System.Security.AccessControl.FileSystemRights]::Delete -bor
+        [long][System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [long][System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor
+        $genericRead -bor
+        $genericWrite -bor
+        $genericAll
+    )
     $acl = Get-Acl -LiteralPath $Path
+    $ownerSid = $acl.GetOwner(
+        [System.Security.Principal.SecurityIdentifier]
+    ).Value
+    if ($ownerSid -notin $allowedSids) {
+        return $false
+    }
     $rules = $acl.GetAccessRules(
         $true,
         $true,
@@ -206,7 +223,7 @@ function Test-SecureWindowsAcl {
             continue
         }
         $rightsMask = [long]$rule.FileSystemRights -band 4294967295
-        if (($rightsMask -band $readMask) -eq 0) {
+        if (($rightsMask -band $sensitiveAccessMask) -eq 0) {
             continue
         }
 
@@ -337,10 +354,10 @@ function Merge-McpEntry {
         }
         $permissionsSecure = Test-SecureFilePermissions -Path $ConfigFile
         if ($Check -and -not $permissionsSecure) {
-            throw "$Label is configured in $ConfigFile, but its permissions allow unapproved read access."
+            throw "$Label is configured in $ConfigFile, but its permissions allow unapproved access or ownership."
         }
         if ($IsWindowsPlatform -and -not $Check -and -not $permissionsSecure) {
-            throw "$Label config $ConfigFile grants read access outside the current user, SYSTEM, or Administrators; refusing to preserve or copy that ACL."
+            throw "$Label config $ConfigFile grants sensitive access or ownership outside the current user, SYSTEM, or Administrators; refusing to preserve or copy that ACL."
         }
     }
 

@@ -84,6 +84,17 @@ Describe 'Source hygiene' {
         foreach ($sid in @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-18', 'S-1-5-32-544')) {
             $source | Should -Match ([regex]::Escape($sid))
         }
+        foreach ($aclContract in @(
+            'GetOwner',
+            'WriteData',
+            'AppendData',
+            'Delete',
+            'ChangePermissions',
+            'TakeOwnership',
+            '1073741824'
+        )) {
+            $source | Should -Match $aclContract
+        }
     }
 }
 
@@ -230,10 +241,23 @@ Describe 'PowerShell Copilot installer' {
             $LASTEXITCODE | Should -Be 0
         }
 
-        { & $script:PowerShellInstaller -Target Copilot -Check } |
-            Should -Throw '*supported JSON nesting depth*'
-        { & $script:PowerShellInstaller -Target Copilot -Force } |
-            Should -Throw '*supported JSON nesting depth*'
+        $failureMessages = @()
+        foreach ($invocation in @(
+            { & $script:PowerShellInstaller -Target Copilot -Check },
+            { & $script:PowerShellInstaller -Target Copilot -Force }
+        )) {
+            try {
+                & $invocation
+                $failureMessages += ''
+            }
+            catch {
+                $failureMessages += $_.Exception.Message
+            }
+        }
+        $failureMessages.Count | Should -Be 2
+        foreach ($message in $failureMessages) {
+            $message | Should -Match 'supported JSON nesting depth|not valid JSON'
+        }
         [System.IO.File]::ReadAllText($copilotConfig) | Should -Be $inputJson
         @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.bak-*').Count |
             Should -Be 0
@@ -266,14 +290,14 @@ Describe 'PowerShell Copilot installer' {
         $checkOutput = (& $pwsh -NoProfile -File $script:PowerShellInstaller `
             -Target Copilot -Check 2>&1) | Out-String
         $LASTEXITCODE | Should -Not -Be 0
-        $checkOutput | Should -Match 'permissions allow unapproved read access'
+        $checkOutput | Should -Match 'permissions allow unapproved access or ownership'
         [int]([System.IO.File]::GetUnixFileMode($copilotConfig)) | Should -Be 420
 
         & $script:PowerShellInstaller -Target Copilot
         [int]([System.IO.File]::GetUnixFileMode($copilotConfig)) | Should -Be 384
     }
 
-    It 'rejects broad Windows read ACLs without changing or copying them' {
+    It 'rejects broad Windows mutation ACLs without changing or copying them' {
         if (-not $script:IsWindowsHost) {
             Set-ItResult -Skipped -Because 'Windows ACL checks only apply on Windows'
             return
@@ -296,17 +320,18 @@ Describe 'PowerShell Copilot installer' {
         $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $acl = [System.Security.AccessControl.FileSecurity]::new()
         $acl.SetSecurityDescriptorSddlForm(
-            "D:P(A;;FA;;;$currentSid)(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;WD)"
+            "O:$currentSid" +
+            "D:P(A;;FA;;;$currentSid)(A;;FA;;;SY)(A;;FA;;;BA)(A;;GW;;;AU)"
         )
         Set-Acl -LiteralPath $copilotConfig -AclObject $acl
         $originalSddl = (Get-Acl -LiteralPath $copilotConfig).Sddl
 
         { & $script:PowerShellInstaller -Target Copilot -Check } |
-            Should -Throw '*permissions allow unapproved read access*'
+            Should -Throw '*permissions allow unapproved access or ownership*'
         (Get-Acl -LiteralPath $copilotConfig).Sddl | Should -Be $originalSddl
 
         { & $script:PowerShellInstaller -Target Copilot -Force } |
-            Should -Throw '*grants read access outside*'
+            Should -Throw '*grants sensitive access or ownership outside*'
         (Get-Acl -LiteralPath $copilotConfig).Sddl | Should -Be $originalSddl
         @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.bak-*').Count |
             Should -Be 0
