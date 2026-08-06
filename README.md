@@ -151,6 +151,7 @@ Any browser session with New Relic can be revoked in the New Relic UI under Acco
 - **No shared key.** Tokens are session-scoped, revocable from the NR UI at any time.
 - **Separate New Relic token.** New Relic's OAuth/DCR flow issues a New Relic access/refresh token for the MCP resource. It is distinct from the GitHub OAuth token used to authenticate Copilot.
 - **No token in MCP config.** The separate New Relic OAuth token is managed by the client credential store, not written by these installers. Copilot CLI documents a local fallback under `~/.copilot/mcp-oauth-config/` only when keychain-backed storage is unavailable.
+- **Protected configuration.** The PowerShell installer restricts new, temporary, and backup config files to mode `0600` on Unix. On Windows it preserves an existing file's ACL across backup/replacement and gives new files a protected current-user-only ACL.
 - **Separate trust domains.** GitHub/Copilot authentication is never reused as New Relic authorization.
 
 ## GitHub Copilot product limitations

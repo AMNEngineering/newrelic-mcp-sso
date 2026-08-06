@@ -32,6 +32,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ReplaceExisting = $Force.IsPresent
+$IsWindowsPlatform = $env:OS -eq 'Windows_NT'
 
 function Write-Ok    ([string]$Message) { Write-Host "[OK] $Message" -ForegroundColor Green }
 function Write-Warn2 ([string]$Message) { Write-Host "! $Message" -ForegroundColor Yellow }
@@ -81,6 +82,38 @@ function Test-EntriesEqual {
     $currentJson = $Current | ConvertTo-Json -Depth 20 -Compress
     $desiredJson = $Desired | ConvertTo-Json -Depth 20 -Compress
     return $currentJson -eq $desiredJson
+}
+
+function New-UserOnlyWindowsAcl {
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl = [System.Security.AccessControl.FileSecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+        $currentUser,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    [void]$acl.AddAccessRule($rule)
+    return $acl
+}
+
+function Set-SecureFilePermissions {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [System.Security.AccessControl.FileSecurity]$WindowsAcl
+    )
+
+    if ($IsWindowsPlatform) {
+        $acl = if ($null -ne $WindowsAcl) { $WindowsAcl } else { New-UserOnlyWindowsAcl }
+        Set-Acl -LiteralPath $Path -AclObject $acl
+        return
+    }
+
+    $chmod = Get-Command chmod -CommandType Application -ErrorAction Stop
+    & $chmod.Source 600 $Path
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to restrict permissions on $Path"
+    }
 }
 
 function Merge-McpEntry {
@@ -148,9 +181,17 @@ function Merge-McpEntry {
     }
 
     $backup = $null
+    $originalWindowsAcl = if ($hadFile -and $IsWindowsPlatform) {
+        Get-Acl -LiteralPath $ConfigFile
+    }
+    else {
+        $null
+    }
+
     if ($hadFile) {
         $backup = "$ConfigFile.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
         Copy-Item -LiteralPath $ConfigFile -Destination $backup -Force
+        Set-SecureFilePermissions -Path $backup -WindowsAcl $originalWindowsAcl
         Write-Ok "backed up existing config -> $backup"
     }
 
@@ -163,17 +204,25 @@ function Merge-McpEntry {
     $existing[$Section]['newrelic'] = $Entry
 
     $tempFile = "$ConfigFile.tmp-$([guid]::NewGuid().ToString('N'))"
+    $configMoved = $false
     try {
         $json = $existing | ConvertTo-Json -Depth 20
         $bytes = [System.Text.UTF8Encoding]::new($true).GetBytes($json)
         [System.IO.File]::WriteAllBytes($tempFile, $bytes)
+        Set-SecureFilePermissions -Path $tempFile -WindowsAcl $originalWindowsAcl
         Get-Content -Raw -LiteralPath $tempFile | ConvertFrom-Json -ErrorAction Stop | Out-Null
         Move-Item -LiteralPath $tempFile -Destination $ConfigFile -Force
+        $configMoved = $true
+        Set-SecureFilePermissions -Path $ConfigFile -WindowsAcl $originalWindowsAcl
     }
     catch {
         Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
         if ($backup) {
             Copy-Item -LiteralPath $backup -Destination $ConfigFile -Force
+            Set-SecureFilePermissions -Path $ConfigFile -WindowsAcl $originalWindowsAcl
+        }
+        elseif ($configMoved) {
+            Remove-Item -LiteralPath $ConfigFile -Force -ErrorAction SilentlyContinue
         }
         throw
     }

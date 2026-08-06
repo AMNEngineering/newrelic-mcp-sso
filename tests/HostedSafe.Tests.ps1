@@ -111,6 +111,53 @@ Describe 'PowerShell Copilot installer' {
         Test-Path -LiteralPath (Join-Path $script:Workspace '.vscode/mcp.json') | Should -BeFalse
     }
 
+    It 'protects new files and backups without weakening existing Windows ACLs' {
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        $copilotConfig = Join-Path $script:CopilotHome 'mcp-config.json'
+        @'
+{
+  "mcpServers": {
+    "other": {
+      "type": "http",
+      "url": "https://example.invalid/mcp",
+      "headers": {
+        "Authorization": "preserve-but-protect"
+      }
+    }
+  }
+}
+'@ | Set-Content -LiteralPath $copilotConfig -Encoding utf8
+
+        if ($script:IsWindowsHost) {
+            $originalSddl = (Get-Acl -LiteralPath $copilotConfig).Sddl
+        }
+        else {
+            & chmod 600 $copilotConfig
+            $LASTEXITCODE | Should -Be 0
+        }
+
+        & $script:PowerShellInstaller -Target All -Workspace $script:Workspace -Force
+
+        $backup = @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.bak-*')
+        $backup.Count | Should -Be 1
+        $vscodeConfig = Join-Path $script:Workspace '.vscode/mcp.json'
+
+        if ($script:IsWindowsHost) {
+            (Get-Acl -LiteralPath $copilotConfig).Sddl | Should -Be $originalSddl
+            (Get-Acl -LiteralPath $backup[0].FullName).Sddl | Should -Be $originalSddl
+
+            $newFileAcl = Get-Acl -LiteralPath $vscodeConfig
+            $newFileAcl.AreAccessRulesProtected | Should -BeTrue
+            @($newFileAcl.Access).Count | Should -Be 1
+        }
+        else {
+            foreach ($path in @($copilotConfig, $backup[0].FullName, $vscodeConfig)) {
+                [int]([System.IO.File]::GetUnixFileMode($path)) |
+                    Should -Be 384 -Because "$path must be mode 0600"
+            }
+        }
+    }
+
     It 'refuses to replace a non-object MCP section' {
         New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
         '{"mcpServers":"preserve-me"}' |
