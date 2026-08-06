@@ -1,0 +1,257 @@
+#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
+
+BeforeDiscovery {
+    $script:RepoRoot = Split-Path -Parent $PSScriptRoot
+    $script:BashInstaller = Join-Path $script:RepoRoot 'install-copilot.sh'
+    $script:PowerShellInstaller = Join-Path $script:RepoRoot 'install-copilot.ps1'
+    $script:IsWindowsHost = $env:OS -eq 'Windows_NT'
+}
+
+BeforeAll {
+    $script:RepoRoot = Split-Path -Parent $PSScriptRoot
+    $script:BashInstaller = Join-Path $script:RepoRoot 'install-copilot.sh'
+    $script:PowerShellInstaller = Join-Path $script:RepoRoot 'install-copilot.ps1'
+    $script:IsWindowsHost = $env:OS -eq 'Windows_NT'
+
+    function New-TestRoot {
+        $path = Join-Path ([System.IO.Path]::GetTempPath()) "newrelic-mcp-sso-$([guid]::NewGuid())"
+        New-Item -ItemType Directory -Path $path -Force | Out-Null
+        return $path
+    }
+}
+
+Describe 'Source hygiene' {
+    It '<Name> parses without PowerShell syntax errors' -ForEach @(
+        @{ Name = 'install.ps1'; Path = (Join-Path $script:RepoRoot 'install.ps1') }
+        @{ Name = 'install-copilot.ps1'; Path = $script:PowerShellInstaller }
+        @{ Name = 'Run-Tests.ps1'; Path = (Join-Path $script:RepoRoot 'Run-Tests.ps1') }
+    ) {
+        $tokens = $null
+        $parseErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseFile(
+            $Path,
+            [ref]$tokens,
+            [ref]$parseErrors
+        ) | Out-Null
+        $parseErrors | Should -BeNullOrEmpty
+    }
+
+    It 'both Bash installers pass syntax validation' {
+        if ($script:IsWindowsHost) {
+            Set-ItResult -Skipped -Because 'Bash behavior runs in the Linux hosted-safe job'
+            return
+        }
+        $bash = Get-Command bash -ErrorAction SilentlyContinue
+        if (-not $bash) {
+            Set-ItResult -Skipped -Because 'bash is not installed'
+            return
+        }
+
+        & $bash.Source -n (Join-Path $script:RepoRoot 'install.sh')
+        $LASTEXITCODE | Should -Be 0
+        & $bash.Source -n $script:BashInstaller
+        $LASTEXITCODE | Should -Be 0
+    }
+}
+
+Describe 'PowerShell Copilot installer' {
+    BeforeEach {
+        $script:TempRoot = New-TestRoot
+        $script:CopilotHome = Join-Path $script:TempRoot 'copilot-home'
+        $script:Workspace = Join-Path $script:TempRoot 'workspace'
+        New-Item -ItemType Directory -Path $script:Workspace -Force | Out-Null
+        $script:PreviousCopilotHome = $env:COPILOT_HOME
+        $env:COPILOT_HOME = $script:CopilotHome
+    }
+
+    AfterEach {
+        if ($null -eq $script:PreviousCopilotHome) {
+            Remove-Item Env:COPILOT_HOME -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:COPILOT_HOME = $script:PreviousCopilotHome
+        }
+        Remove-Item -LiteralPath $script:TempRoot -Recurse -Force
+    }
+
+    It 'merges app/CLI and VS Code schemas without secrets' {
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        @'
+{
+  "theme": "dark",
+  "mcpServers": {
+    "other": {
+      "type": "stdio",
+      "command": "other"
+    }
+  }
+}
+'@ | Set-Content -LiteralPath (Join-Path $script:CopilotHome 'mcp-config.json') -Encoding utf8
+
+        & $script:PowerShellInstaller -Target All -Workspace $script:Workspace -Force
+
+        $copilot = Get-Content -Raw -LiteralPath (Join-Path $script:CopilotHome 'mcp-config.json') | ConvertFrom-Json
+        $vscode = Get-Content -Raw -LiteralPath (Join-Path $script:Workspace '.vscode/mcp.json') | ConvertFrom-Json
+
+        $copilot.theme | Should -Be 'dark'
+        $copilot.mcpServers.other.command | Should -Be 'other'
+        $copilot.mcpServers.newrelic.type | Should -Be 'http'
+        $copilot.mcpServers.newrelic.url | Should -Be 'https://mcp.newrelic.com/mcp/'
+        @($copilot.mcpServers.newrelic.tools) | Should -Be @('*')
+        $vscode.servers.newrelic.type | Should -Be 'http'
+        $vscode.servers.newrelic.url | Should -Be 'https://mcp.newrelic.com/mcp/'
+        $copilot.mcpServers.newrelic.PSObject.Properties.Name | Should -Not -Contain 'headers'
+        $vscode.servers.newrelic.PSObject.Properties.Name | Should -Not -Contain 'headers'
+    }
+
+    It 'does not create files in check mode' {
+        & $script:PowerShellInstaller -Target All -Workspace $script:Workspace -Check
+
+        Test-Path -LiteralPath (Join-Path $script:CopilotHome 'mcp-config.json') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:Workspace '.vscode/mcp.json') | Should -BeFalse
+    }
+
+    It 'refuses to replace a non-object MCP section' {
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        '{"mcpServers":"preserve-me"}' |
+            Set-Content -LiteralPath (Join-Path $script:CopilotHome 'mcp-config.json') -Encoding utf8
+
+        { & $script:PowerShellInstaller -Target Copilot -Workspace $script:Workspace -Force } |
+            Should -Throw '*is not an object*'
+
+        $written = Get-Content -Raw -LiteralPath (Join-Path $script:CopilotHome 'mcp-config.json') |
+            ConvertFrom-Json
+        $written.mcpServers | Should -Be 'preserve-me'
+    }
+
+    It 'rejects a nonexistent VS Code workspace' {
+        $missingWorkspace = Join-Path $script:TempRoot 'missing'
+
+        { & $script:PowerShellInstaller -Target VSCode -Workspace $missingWorkspace -Check } |
+            Should -Throw '*workspace does not exist*'
+    }
+}
+
+Describe 'Bash Copilot installer' {
+    BeforeEach {
+        $script:TempRoot = New-TestRoot
+        $script:CopilotHome = Join-Path $script:TempRoot 'copilot-home'
+        $script:Workspace = Join-Path $script:TempRoot 'workspace'
+        New-Item -ItemType Directory -Path $script:Workspace -Force | Out-Null
+        $script:PreviousCopilotHome = $env:COPILOT_HOME
+        $env:COPILOT_HOME = $script:CopilotHome
+    }
+
+    AfterEach {
+        if ($null -eq $script:PreviousCopilotHome) {
+            Remove-Item Env:COPILOT_HOME -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:COPILOT_HOME = $script:PreviousCopilotHome
+        }
+        Remove-Item -LiteralPath $script:TempRoot -Recurse -Force
+    }
+
+    It 'merges app/CLI and VS Code schemas without secrets' {
+        if ($script:IsWindowsHost) {
+            Set-ItResult -Skipped -Because 'Bash behavior runs in the Linux hosted-safe job'
+            return
+        }
+        $bash = Get-Command bash -ErrorAction SilentlyContinue
+        if (-not $bash) {
+            Set-ItResult -Skipped -Because 'bash is not installed'
+            return
+        }
+
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        '{"theme":"dark","mcpServers":{"other":{"type":"stdio","command":"other"}}}' |
+            Set-Content -LiteralPath (Join-Path $script:CopilotHome 'mcp-config.json') -Encoding utf8
+
+        & $bash.Source $script:BashInstaller --target all --workspace $script:Workspace --force
+        $LASTEXITCODE | Should -Be 0
+
+        $copilot = Get-Content -Raw -LiteralPath (Join-Path $script:CopilotHome 'mcp-config.json') | ConvertFrom-Json
+        $vscode = Get-Content -Raw -LiteralPath (Join-Path $script:Workspace '.vscode/mcp.json') | ConvertFrom-Json
+
+        $copilot.theme | Should -Be 'dark'
+        $copilot.mcpServers.other.command | Should -Be 'other'
+        $copilot.mcpServers.newrelic.type | Should -Be 'http'
+        $copilot.mcpServers.newrelic.url | Should -Be 'https://mcp.newrelic.com/mcp/'
+        @($copilot.mcpServers.newrelic.tools) | Should -Be @('*')
+        $vscode.servers.newrelic.type | Should -Be 'http'
+        $vscode.servers.newrelic.url | Should -Be 'https://mcp.newrelic.com/mcp/'
+        $copilot.mcpServers.newrelic.PSObject.Properties.Name | Should -Not -Contain 'headers'
+        $vscode.servers.newrelic.PSObject.Properties.Name | Should -Not -Contain 'headers'
+    }
+
+    It 'does not create files in check mode' {
+        if ($script:IsWindowsHost) {
+            Set-ItResult -Skipped -Because 'Bash behavior runs in the Linux hosted-safe job'
+            return
+        }
+        $bash = Get-Command bash -ErrorAction SilentlyContinue
+        if (-not $bash) {
+            Set-ItResult -Skipped -Because 'bash is not installed'
+            return
+        }
+
+        & $bash.Source $script:BashInstaller --target all --workspace $script:Workspace --check
+        $LASTEXITCODE | Should -Be 0
+
+        Test-Path -LiteralPath (Join-Path $script:CopilotHome 'mcp-config.json') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:Workspace '.vscode/mcp.json') | Should -BeFalse
+    }
+
+    It 'refuses to replace a non-object MCP section' {
+        if ($script:IsWindowsHost) {
+            Set-ItResult -Skipped -Because 'Bash behavior runs in the Linux hosted-safe job'
+            return
+        }
+        $bash = Get-Command bash -ErrorAction SilentlyContinue
+        if (-not $bash) {
+            Set-ItResult -Skipped -Because 'bash is not installed'
+            return
+        }
+
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        '{"mcpServers":"preserve-me"}' |
+            Set-Content -LiteralPath (Join-Path $script:CopilotHome 'mcp-config.json') -Encoding utf8
+
+        & $bash.Source $script:BashInstaller --target copilot --workspace $script:Workspace --force
+        $LASTEXITCODE | Should -Not -Be 0
+
+        $written = Get-Content -Raw -LiteralPath (Join-Path $script:CopilotHome 'mcp-config.json') |
+            ConvertFrom-Json
+        $written.mcpServers | Should -Be 'preserve-me'
+    }
+
+    It 'rejects a nonexistent VS Code workspace' {
+        if ($script:IsWindowsHost) {
+            Set-ItResult -Skipped -Because 'Bash behavior runs in the Linux hosted-safe job'
+            return
+        }
+        $bash = Get-Command bash -ErrorAction SilentlyContinue
+        if (-not $bash) {
+            Set-ItResult -Skipped -Because 'bash is not installed'
+            return
+        }
+
+        $missingWorkspace = Join-Path $script:TempRoot 'missing'
+        & $bash.Source $script:BashInstaller --target vscode --workspace $missingWorkspace --check
+        $LASTEXITCODE | Should -Not -Be 0
+    }
+}
+
+Describe 'OAuth security contract' {
+    It 'does not put GitHub tokens, New Relic API keys, or authorization headers in Copilot config' {
+        $source = @(
+            Get-Content -Raw -LiteralPath $script:BashInstaller
+            Get-Content -Raw -LiteralPath $script:PowerShellInstaller
+        ) -join "`n"
+
+        $source | Should -Not -Match 'NRAK-'
+        $source | Should -Not -Match 'COPILOT_GITHUB_TOKEN'
+        $source | Should -Not -Match 'Authorization\s*='
+        $source | Should -Match 'separate New Relic'
+    }
+}
