@@ -18,6 +18,29 @@ BeforeAll {
         New-Item -ItemType Directory -Path $path -Force | Out-Null
         return $path
     }
+
+    function Set-TestSafeWindowsAcl {
+        param([Parameter(Mandatory)][string]$Path)
+
+        $acl = [System.Security.AccessControl.FileSecurity]::new()
+        $acl.SetAccessRuleProtection($true, $false)
+        $fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
+        $allow = [System.Security.AccessControl.AccessControlType]::Allow
+        $sids = @(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User,
+            [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+            [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+        )
+        foreach ($sid in $sids) {
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $sid,
+                $fullControl,
+                $allow
+            )
+            [void]$acl.AddAccessRule($rule)
+        }
+        Set-Acl -LiteralPath $Path -AclObject $acl
+    }
 }
 
 Describe 'Source hygiene' {
@@ -51,6 +74,16 @@ Describe 'Source hygiene' {
         $LASTEXITCODE | Should -Be 0
         & $bash.Source -n $script:BashInstaller
         $LASTEXITCODE | Should -Be 0
+    }
+
+    It 'uses atomic replacement and an explicit Windows ACL allowlist' {
+        $source = [System.IO.File]::ReadAllText($script:PowerShellInstaller)
+
+        $source | Should -Match '\[System\.IO\.File\]::Replace\(\$tempFile, \$ConfigFile, \$displacedFile\)'
+        $source | Should -Not -Match '(?m)^\s*Move-Item .*\$tempFile.*-Force'
+        foreach ($sid in @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-18', 'S-1-5-32-544')) {
+            $source | Should -Match ([regex]::Escape($sid))
+        }
     }
 }
 
@@ -140,6 +173,72 @@ Describe 'PowerShell Copilot installer' {
         $written.mcpServers.other.command | Should -Be 'preserve'
     }
 
+    It 'preserves unrelated JSON nested beyond the previous depth limit' {
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        $copilotConfig = Join-Path $script:CopilotHome 'mcp-config.json'
+        $deepValue = [ordered]@{ value = 'preserve-deep-value' }
+        for ($level = 34; $level -ge 0; $level--) {
+            $deepValue = [ordered]@{ "level$level" = $deepValue }
+        }
+        $inputDocument = [ordered]@{
+            unrelated = $deepValue
+            mcpServers = [ordered]@{
+                other = [ordered]@{ command = 'preserve' }
+            }
+        }
+        [System.IO.File]::WriteAllText(
+            $copilotConfig,
+            ($inputDocument | ConvertTo-Json -Depth 100),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        if ($script:IsWindowsHost) {
+            Set-TestSafeWindowsAcl -Path $copilotConfig
+        }
+        else {
+            & chmod 600 $copilotConfig
+            $LASTEXITCODE | Should -Be 0
+        }
+
+        & $script:PowerShellInstaller -Target Copilot -Force
+
+        $written = Get-Content -Raw -LiteralPath $copilotConfig | ConvertFrom-Json
+        $cursor = $written.unrelated
+        for ($level = 0; $level -le 34; $level++) {
+            $cursor = $cursor."level$level"
+        }
+        $cursor.value | Should -Be 'preserve-deep-value'
+    }
+
+    It 'refuses JSON deeper than the supported serialization limit' {
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        $copilotConfig = Join-Path $script:CopilotHome 'mcp-config.json'
+        $deepJson = '"preserve-too-deep"'
+        for ($level = 0; $level -le 101; $level++) {
+            $deepJson = "{`"level$level`":$deepJson}"
+        }
+        $inputJson = "{`"unrelated`":$deepJson}"
+        [System.IO.File]::WriteAllText(
+            $copilotConfig,
+            $inputJson,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        if ($script:IsWindowsHost) {
+            Set-TestSafeWindowsAcl -Path $copilotConfig
+        }
+        else {
+            & chmod 600 $copilotConfig
+            $LASTEXITCODE | Should -Be 0
+        }
+
+        { & $script:PowerShellInstaller -Target Copilot -Check } |
+            Should -Throw '*supported JSON nesting depth*'
+        { & $script:PowerShellInstaller -Target Copilot -Force } |
+            Should -Throw '*supported JSON nesting depth*'
+        [System.IO.File]::ReadAllText($copilotConfig) | Should -Be $inputJson
+        @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.bak-*').Count |
+            Should -Be 0
+    }
+
     It 'reports and fixes unsafe permissions on an idempotent Unix install' {
         if ($script:IsWindowsHost) {
             Set-ItResult -Skipped -Because 'Unix mode checks do not apply on Windows'
@@ -167,11 +266,50 @@ Describe 'PowerShell Copilot installer' {
         $checkOutput = (& $pwsh -NoProfile -File $script:PowerShellInstaller `
             -Target Copilot -Check 2>&1) | Out-String
         $LASTEXITCODE | Should -Not -Be 0
-        $checkOutput | Should -Match 'permissions are not user-only'
+        $checkOutput | Should -Match 'permissions allow unapproved read access'
         [int]([System.IO.File]::GetUnixFileMode($copilotConfig)) | Should -Be 420
 
         & $script:PowerShellInstaller -Target Copilot
         [int]([System.IO.File]::GetUnixFileMode($copilotConfig)) | Should -Be 384
+    }
+
+    It 'rejects broad Windows read ACLs without changing or copying them' {
+        if (-not $script:IsWindowsHost) {
+            Set-ItResult -Skipped -Because 'Windows ACL checks only apply on Windows'
+            return
+        }
+
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        $copilotConfig = Join-Path $script:CopilotHome 'mcp-config.json'
+        @'
+{
+  "mcpServers": {
+    "newrelic": {
+      "type": "http",
+      "url": "https://mcp.newrelic.com/mcp/",
+      "tools": ["*"]
+    }
+  }
+}
+'@ | Set-Content -LiteralPath $copilotConfig -Encoding utf8
+        Set-TestSafeWindowsAcl -Path $copilotConfig
+        $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $acl = [System.Security.AccessControl.FileSecurity]::new()
+        $acl.SetSecurityDescriptorSddlForm(
+            "D:P(A;;FA;;;$currentSid)(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;WD)"
+        )
+        Set-Acl -LiteralPath $copilotConfig -AclObject $acl
+        $originalSddl = (Get-Acl -LiteralPath $copilotConfig).Sddl
+
+        { & $script:PowerShellInstaller -Target Copilot -Check } |
+            Should -Throw '*permissions allow unapproved read access*'
+        (Get-Acl -LiteralPath $copilotConfig).Sddl | Should -Be $originalSddl
+
+        { & $script:PowerShellInstaller -Target Copilot -Force } |
+            Should -Throw '*grants read access outside*'
+        (Get-Acl -LiteralPath $copilotConfig).Sddl | Should -Be $originalSddl
+        @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.bak-*').Count |
+            Should -Be 0
     }
 
     It 'protects new files and backups without weakening existing Windows ACLs' {
@@ -192,6 +330,7 @@ Describe 'PowerShell Copilot installer' {
 '@ | Set-Content -LiteralPath $copilotConfig -Encoding utf8
 
         if ($script:IsWindowsHost) {
+            Set-TestSafeWindowsAcl -Path $copilotConfig
             $originalSddl = (Get-Acl -LiteralPath $copilotConfig).Sddl
         }
         else {
@@ -269,6 +408,8 @@ Describe 'PowerShell Copilot installer' {
         '{"mcpServers":{"other":{"headers":{"Authorization":"restore-me"}}}}' |
             Set-Content -LiteralPath $copilotConfig -Encoding utf8
         $originalContent = Get-Content -Raw -LiteralPath $copilotConfig
+        & chmod 600 $copilotConfig
+        $LASTEXITCODE | Should -Be 0
 
         $realChmod = (Get-Command chmod -CommandType Application -ErrorAction Stop).Source
         $fakeBin = Join-Path $script:TempRoot 'fake-bin'
@@ -288,7 +429,7 @@ exec "$realChmod" "`$@"
         try {
             $env:PATH = "$fakeBin$([System.IO.Path]::PathSeparator)$previousPath"
             { & $script:PowerShellInstaller -Target Copilot -Force } |
-                Should -Throw '*failed to restrict permissions*'
+                Should -Throw '*verified rollback failed*'
         }
         finally {
             $env:PATH = $previousPath
@@ -297,9 +438,12 @@ exec "$realChmod" "`$@"
         Test-Path -LiteralPath $copilotConfig | Should -BeTrue
         (Get-Content -Raw -LiteralPath $copilotConfig) | Should -Be $originalContent
         [int]([System.IO.File]::GetUnixFileMode($copilotConfig)) | Should -Be 384
-        @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.bak-*').Count |
-            Should -Be 0
+        $backups = @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.bak-*')
+        $backups.Count | Should -Be 1
+        [int]([System.IO.File]::GetUnixFileMode($backups[0].FullName)) | Should -Be 384
         @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.restore-*').Count |
+            Should -Be 0
+        @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.displaced-*').Count |
             Should -Be 0
     }
 

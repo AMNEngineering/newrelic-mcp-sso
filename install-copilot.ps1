@@ -34,6 +34,7 @@ $ErrorActionPreference = 'Stop'
 $ReplaceExisting = $Force.IsPresent
 $IsWindowsPlatform = $env:OS -eq 'Windows_NT'
 $StrictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+$JsonSerializationDepth = 100
 
 function Write-Ok    ([string]$Message) { Write-Host "[OK] $Message" -ForegroundColor Green }
 function Write-Warn2 ([string]$Message) { Write-Host "! $Message" -ForegroundColor Yellow }
@@ -80,8 +81,10 @@ function Test-EntriesEqual {
         [Parameter(Mandatory)]$Desired
     )
 
-    $currentJson = ConvertTo-CanonicalJsonValue $Current | ConvertTo-Json -Depth 20 -Compress
-    $desiredJson = ConvertTo-CanonicalJsonValue $Desired | ConvertTo-Json -Depth 20 -Compress
+    $currentJson = ConvertTo-CanonicalJsonValue $Current |
+        ConvertTo-Json -Depth $JsonSerializationDepth -Compress
+    $desiredJson = ConvertTo-CanonicalJsonValue $Desired |
+        ConvertTo-Json -Depth $JsonSerializationDepth -Compress
     return $currentJson -eq $desiredJson
 }
 
@@ -108,6 +111,30 @@ function ConvertTo-CanonicalJsonValue {
     }
 
     return $Object
+}
+
+function Assert-JsonSerializationDepth {
+    param(
+        $Object,
+        [int]$Depth = 0
+    )
+
+    if ($Depth -gt $JsonSerializationDepth) {
+        throw "existing configuration exceeds the supported JSON nesting depth of $JsonSerializationDepth - refusing to rewrite it."
+    }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($value in $Object.Values) {
+            Assert-JsonSerializationDepth -Object $value -Depth ($Depth + 1)
+        }
+        return
+    }
+
+    if ($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [string])) {
+        foreach ($value in $Object) {
+            Assert-JsonSerializationDepth -Object $value -Depth ($Depth + 1)
+        }
+    }
 }
 
 function Read-Utf8FileText {
@@ -149,11 +176,54 @@ function Set-SecureFilePermissions {
     }
 }
 
+function Test-SecureWindowsAcl {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $allowedSids = @(
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+        'S-1-5-18',      # SYSTEM
+        'S-1-5-32-544'   # BUILTIN\Administrators
+    )
+    $broadSids = @(
+        'S-1-1-0',       # Everyone
+        'S-1-5-11',      # Authenticated Users
+        'S-1-5-32-545'   # BUILTIN\Users
+    )
+    $genericRead = [long]2147483648
+    $genericAll = [long]268435456
+    $readMask = [long][System.Security.AccessControl.FileSystemRights]::ReadData -bor
+        $genericRead -bor $genericAll
+    $acl = Get-Acl -LiteralPath $Path
+    $rules = $acl.GetAccessRules(
+        $true,
+        $true,
+        [System.Security.Principal.SecurityIdentifier]
+    )
+
+    foreach ($rule in $rules) {
+        if ($rule.AccessControlType -ne
+            [System.Security.AccessControl.AccessControlType]::Allow) {
+            continue
+        }
+        $rightsMask = [long]$rule.FileSystemRights -band 4294967295
+        if (($rightsMask -band $readMask) -eq 0) {
+            continue
+        }
+
+        $sid = $rule.IdentityReference.Value
+        if ($sid -in $broadSids -or $sid -notin $allowedSids) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
 function Test-SecureFilePermissions {
     param([Parameter(Mandatory)][string]$Path)
 
     if ($IsWindowsPlatform) {
-        return $true
+        return Test-SecureWindowsAcl -Path $Path
     }
 
     return [int]([System.IO.File]::GetUnixFileMode($Path)) -eq 384
@@ -213,6 +283,10 @@ function Restore-SecureFileBytes {
         else {
             Move-Item -LiteralPath $restoreFile -Destination $Path
         }
+        Set-SecureFilePermissions -Path $Path -WindowsAcl $WindowsAcl
+        if (-not (Test-SecureFilePermissions -Path $Path)) {
+            throw "failed to verify restored permissions on $Path"
+        }
     }
     catch {
         Remove-Item -LiteralPath $restoreFile -Force -ErrorAction SilentlyContinue
@@ -239,6 +313,7 @@ function Merge-McpEntry {
     $existing = $null
     $current = $null
     $hadFile = Test-Path -LiteralPath $ConfigFile
+    $permissionsSecure = $true
 
     if ($hadFile) {
         Write-Info "Found existing $ConfigFile"
@@ -260,22 +335,26 @@ function Merge-McpEntry {
                 $current = $existing[$Section]['newrelic']
             }
         }
+        $permissionsSecure = Test-SecureFilePermissions -Path $ConfigFile
+        if ($Check -and -not $permissionsSecure) {
+            throw "$Label is configured in $ConfigFile, but its permissions allow unapproved read access."
+        }
+        if ($IsWindowsPlatform -and -not $Check -and -not $permissionsSecure) {
+            throw "$Label config $ConfigFile grants read access outside the current user, SYSTEM, or Administrators; refusing to preserve or copy that ACL."
+        }
     }
 
     if ($null -ne $current -and (Test-EntriesEqual -Current $current -Desired $Entry)) {
-        $permissionsSecure = Test-SecureFilePermissions -Path $ConfigFile
         if ($Check) {
-            if ($permissionsSecure) {
-                Write-Ok "$Label is already configured securely in $ConfigFile"
-            }
-            else {
-                throw "$Label is configured, but $ConfigFile permissions are not user-only; install would restrict them to mode 0600."
-            }
+            Write-Ok "$Label is already configured securely in $ConfigFile"
             return
         }
 
         if (-not $permissionsSecure) {
             Set-SecureFilePermissions -Path $ConfigFile
+            if (-not (Test-SecureFilePermissions -Path $ConfigFile)) {
+                throw "failed to verify secure permissions on $ConfigFile"
+            }
             Write-Ok "$Label was already configured; restricted $ConfigFile to mode 0600"
         }
         else {
@@ -283,6 +362,15 @@ function Merge-McpEntry {
         }
         return
     }
+
+    if ($null -eq $existing) {
+        $existing = [ordered]@{}
+    }
+    if (-not $existing.Contains($Section) -or $null -eq $existing[$Section]) {
+        $existing[$Section] = [ordered]@{}
+    }
+    $existing[$Section]['newrelic'] = $Entry
+    Assert-JsonSerializationDepth -Object $existing
 
     if ($Check) {
         if ($null -ne $current) {
@@ -316,46 +404,67 @@ function Merge-McpEntry {
     else {
         $null
     }
-
-    if ($hadFile) {
-        $backup = "$ConfigFile.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss-fff')"
-        $backupBytes = [System.IO.File]::ReadAllBytes($ConfigFile)
-        Write-SecureFileBytes -Path $backup -Bytes $backupBytes -WindowsAcl $originalWindowsAcl
-        Write-Ok "backed up existing config -> $backup"
-    }
-
-    if ($null -eq $existing) {
-        $existing = [ordered]@{}
-    }
-    if (-not $existing.Contains($Section) -or $null -eq $existing[$Section]) {
-        $existing[$Section] = [ordered]@{}
-    }
-    $existing[$Section]['newrelic'] = $Entry
-
     $tempFile = "$ConfigFile.tmp-$([guid]::NewGuid().ToString('N'))"
-    $configMoved = $false
+    $displacedFile = "$ConfigFile.displaced-$([guid]::NewGuid().ToString('N'))"
+    $configReplaced = $false
     try {
-        $json = $existing | ConvertTo-Json -Depth 20
+        if ($hadFile) {
+            $backup = "$ConfigFile.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss-fff')"
+            $backupBytes = [System.IO.File]::ReadAllBytes($ConfigFile)
+            Write-SecureFileBytes -Path $backup -Bytes $backupBytes -WindowsAcl $originalWindowsAcl
+            if (-not (Test-SecureFilePermissions -Path $backup)) {
+                throw "backup permissions could not be verified as secure for $backup"
+            }
+            Write-Ok "backed up existing config -> $backup"
+
+            if (-not $permissionsSecure) {
+                Set-SecureFilePermissions -Path $ConfigFile
+                if (-not (Test-SecureFilePermissions -Path $ConfigFile)) {
+                    throw "failed to verify secure permissions on $ConfigFile"
+                }
+            }
+        }
+
+        $json = $existing | ConvertTo-Json -Depth $JsonSerializationDepth
         $bytes = [System.Text.UTF8Encoding]::new($true).GetBytes($json)
         Write-SecureFileBytes -Path $tempFile -Bytes $bytes -WindowsAcl $originalWindowsAcl
         Read-Utf8FileText -Path $tempFile | ConvertFrom-Json -ErrorAction Stop | Out-Null
-        Move-Item -LiteralPath $tempFile -Destination $ConfigFile -Force
-        $configMoved = $true
+        if ($hadFile) {
+            [System.IO.File]::Replace($tempFile, $ConfigFile, $displacedFile)
+        }
+        else {
+            Move-Item -LiteralPath $tempFile -Destination $ConfigFile
+        }
+        $configReplaced = $true
         Set-SecureFilePermissions -Path $ConfigFile -WindowsAcl $originalWindowsAcl
+        if (-not (Test-SecureFilePermissions -Path $ConfigFile)) {
+            throw "failed to verify secure permissions on $ConfigFile"
+        }
+        if ($hadFile) {
+            Remove-Item -LiteralPath $displacedFile -Force
+        }
     }
     catch {
+        $operationError = $_
         Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
-        if ($backup -and $configMoved) {
+        if ($backup -and $configReplaced) {
             $restoreBytes = [System.IO.File]::ReadAllBytes($backup)
-            Restore-SecureFileBytes -Path $ConfigFile -Bytes $restoreBytes -WindowsAcl $originalWindowsAcl
+            try {
+                Restore-SecureFileBytes -Path $ConfigFile -Bytes $restoreBytes -WindowsAcl $originalWindowsAcl
+            }
+            catch {
+                Remove-Item -LiteralPath $displacedFile -Force -ErrorAction SilentlyContinue
+                throw "installation and verified rollback failed; secure backup retained at $backup. Rollback error: $($_.Exception.Message)"
+            }
         }
-        elseif ($configMoved) {
+        elseif ($configReplaced) {
             Remove-Item -LiteralPath $ConfigFile -Force -ErrorAction SilentlyContinue
         }
         if ($backup) {
             Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
         }
-        throw
+        Remove-Item -LiteralPath $displacedFile -Force -ErrorAction SilentlyContinue
+        throw $operationError
     }
 
     Write-Ok "$Label added 'newrelic' to $ConfigFile"
