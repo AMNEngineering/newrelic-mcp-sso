@@ -141,7 +141,7 @@ merge_entry() {
   local current=""
   local desired
   local parent_dir
-  local backup
+  local backup=""
   local temp_file
 
   desired=$(printf '%s' "$entry" | jq -S -c .)
@@ -183,30 +183,66 @@ merge_entry() {
   mkdir -p "$parent_dir"
 
   if [[ -f "$cfg_file" ]]; then
-    backup="${cfg_file}.bak-$(date +%Y%m%d-%H%M%S)"
-    cp "$cfg_file" "$backup"
+    if ! backup=$(mktemp "${cfg_file}.bak-$(date +%Y%m%d-%H%M%S).XXXXXX"); then
+      fail "failed to create a unique backup for $cfg_file"
+      return 1
+    fi
+    if ! chmod 600 "$backup" ||
+       ! cat "$cfg_file" > "$backup" ||
+       ! chmod 600 "$backup"; then
+      rm -f "$backup"
+      fail "failed to create a secure backup for $cfg_file"
+      return 1
+    fi
     ok "backed up existing config -> $backup"
-    temp_file=$(mktemp "${cfg_file}.tmp.XXXXXX")
+    if ! temp_file=$(mktemp "${cfg_file}.tmp.XXXXXX"); then
+      rm -f "$backup"
+      fail "failed to create a secure temporary file for $cfg_file"
+      return 1
+    fi
+    if ! chmod 600 "$temp_file"; then
+      rm -f "$temp_file" "$backup"
+      fail "failed to secure the temporary file for $cfg_file"
+      return 1
+    fi
     if ! jq --arg section "$section" --argjson entry "$entry" \
       '.[$section] = ((.[$section] // {}) | .newrelic = $entry)' \
       "$cfg_file" > "$temp_file"; then
-      rm -f "$temp_file"
+      rm -f "$temp_file" "$backup"
       fail "failed to merge $cfg_file"
       return 1
     fi
   else
-    temp_file=$(mktemp "${cfg_file}.tmp.XXXXXX")
-    jq -n --arg section "$section" --argjson entry "$entry" \
-      '{($section): {newrelic: $entry}}' > "$temp_file"
+    if ! temp_file=$(mktemp "${cfg_file}.tmp.XXXXXX"); then
+      fail "failed to create a secure temporary file for $cfg_file"
+      return 1
+    fi
+    if ! chmod 600 "$temp_file"; then
+      rm -f "$temp_file"
+      fail "failed to secure the temporary file for $cfg_file"
+      return 1
+    fi
+    if ! jq -n --arg section "$section" --argjson entry "$entry" \
+      '{($section): {newrelic: $entry}}' > "$temp_file"; then
+      rm -f "$temp_file"
+      fail "failed to create $cfg_file"
+      return 1
+    fi
   fi
 
   if ! jq empty "$temp_file" >/dev/null 2>&1; then
     rm -f "$temp_file"
+    [[ -n "$backup" ]] && rm -f "$backup"
     fail "post-write validation failed for $cfg_file"
     return 1
   fi
 
-  mv "$temp_file" "$cfg_file"
+  if ! mv "$temp_file" "$cfg_file"; then
+    rm -f "$temp_file"
+    [[ -n "$backup" ]] && rm -f "$backup"
+    fail "failed to replace $cfg_file"
+    return 1
+  fi
   ok "$label added 'newrelic' to $cfg_file"
 }
 

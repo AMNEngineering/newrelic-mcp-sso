@@ -111,6 +111,65 @@ Describe 'PowerShell Copilot installer' {
         Test-Path -LiteralPath (Join-Path $script:Workspace '.vscode/mcp.json') | Should -BeFalse
     }
 
+    It 'preserves BOM-less UTF-8 config content' {
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        $copilotConfig = Join-Path $script:CopilotHome 'mcp-config.json'
+        $inputJson = @'
+{
+  "displayName": "München 東京",
+  "mcpServers": {
+    "other": {
+      "command": "preserve"
+    }
+  }
+}
+'@
+        [System.IO.File]::WriteAllText(
+            $copilotConfig,
+            $inputJson,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+
+        & $script:PowerShellInstaller -Target Copilot -Force
+
+        $written = [System.IO.File]::ReadAllText(
+            $copilotConfig,
+            [System.Text.UTF8Encoding]::new($false, $true)
+        ) | ConvertFrom-Json
+        $written.displayName | Should -Be 'München 東京'
+        $written.mcpServers.other.command | Should -Be 'preserve'
+    }
+
+    It 'reports and fixes unsafe permissions on an idempotent Unix install' {
+        if ($script:IsWindowsHost) {
+            Set-ItResult -Skipped -Because 'Unix mode checks do not apply on Windows'
+            return
+        }
+
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        $copilotConfig = Join-Path $script:CopilotHome 'mcp-config.json'
+        @'
+{
+  "mcpServers": {
+    "newrelic": {
+      "tools": ["*"],
+      "url": "https://mcp.newrelic.com/mcp/",
+      "type": "http"
+    }
+  }
+}
+'@ | Set-Content -LiteralPath $copilotConfig -Encoding utf8
+        & chmod 644 $copilotConfig
+        $LASTEXITCODE | Should -Be 0
+
+        $checkOutput = (& $script:PowerShellInstaller -Target Copilot -Check 6>&1) | Out-String
+        $checkOutput | Should -Match 'permissions are not user-only'
+        [int]([System.IO.File]::GetUnixFileMode($copilotConfig)) | Should -Be 420
+
+        & $script:PowerShellInstaller -Target Copilot
+        [int]([System.IO.File]::GetUnixFileMode($copilotConfig)) | Should -Be 384
+    }
+
     It 'protects new files and backups without weakening existing Windows ACLs' {
         New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
         $copilotConfig = Join-Path $script:CopilotHome 'mcp-config.json'
@@ -329,6 +388,60 @@ Describe 'Bash Copilot installer' {
 
         Test-Path -LiteralPath (Join-Path $script:CopilotHome 'mcp-config.json') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $script:Workspace '.vscode/mcp.json') | Should -BeFalse
+    }
+
+    It 'creates exclusive mode 0600 backups without predictable overwrite' {
+        if ($script:IsWindowsHost) {
+            Set-ItResult -Skipped -Because 'Bash behavior runs in the Linux hosted-safe job'
+            return
+        }
+        $bash = Get-Command bash -ErrorAction SilentlyContinue
+        if (-not $bash) {
+            Set-ItResult -Skipped -Because 'bash is not installed'
+            return
+        }
+
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        $copilotConfig = Join-Path $script:CopilotHome 'mcp-config.json'
+        '{"mcpServers":{"other":{"headers":{"Authorization":"preserve-me"}}}}' |
+            Set-Content -LiteralPath $copilotConfig -Encoding utf8
+
+        $realChmod = (Get-Command chmod -CommandType Application -ErrorAction Stop).Source
+        $fakeBin = Join-Path $script:TempRoot 'fake-bin'
+        $fakeDate = Join-Path $fakeBin 'date'
+        New-Item -ItemType Directory -Path $fakeBin -Force | Out-Null
+        "#!/bin/sh`nprintf '%s\n' '20260806-180000'`n" |
+            Set-Content -LiteralPath $fakeDate -Encoding utf8
+        & $realChmod +x $fakeDate
+        $LASTEXITCODE | Should -Be 0
+
+        $previousPath = $env:PATH
+        try {
+            $env:PATH = "$fakeBin$([System.IO.Path]::PathSeparator)$previousPath"
+            & $bash.Source $script:BashInstaller --target copilot --force
+            $LASTEXITCODE | Should -Be 0
+
+            $document = Get-Content -Raw -LiteralPath $copilotConfig | ConvertFrom-Json
+            $document.mcpServers.newrelic.url = 'https://conflict.invalid/mcp'
+            [System.IO.File]::WriteAllText(
+                $copilotConfig,
+                ($document | ConvertTo-Json -Depth 20),
+                [System.Text.UTF8Encoding]::new($false)
+            )
+
+            & $bash.Source $script:BashInstaller --target copilot --force
+            $LASTEXITCODE | Should -Be 0
+        }
+        finally {
+            $env:PATH = $previousPath
+        }
+
+        $backups = @(Get-ChildItem -LiteralPath $script:CopilotHome -Filter 'mcp-config.json.bak-*')
+        $backups.Count | Should -Be 2
+        foreach ($backup in $backups) {
+            [int]([System.IO.File]::GetUnixFileMode($backup.FullName)) |
+                Should -Be 384 -Because "$($backup.FullName) must be mode 0600"
+        }
     }
 
     It 'refuses to replace a non-object MCP section' {

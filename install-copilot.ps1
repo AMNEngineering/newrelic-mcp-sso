@@ -33,6 +33,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ReplaceExisting = $Force.IsPresent
 $IsWindowsPlatform = $env:OS -eq 'Windows_NT'
+$StrictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 
 function Write-Ok    ([string]$Message) { Write-Host "[OK] $Message" -ForegroundColor Green }
 function Write-Warn2 ([string]$Message) { Write-Host "! $Message" -ForegroundColor Yellow }
@@ -79,9 +80,40 @@ function Test-EntriesEqual {
         [Parameter(Mandatory)]$Desired
     )
 
-    $currentJson = $Current | ConvertTo-Json -Depth 20 -Compress
-    $desiredJson = $Desired | ConvertTo-Json -Depth 20 -Compress
+    $currentJson = ConvertTo-CanonicalJsonValue $Current | ConvertTo-Json -Depth 20 -Compress
+    $desiredJson = ConvertTo-CanonicalJsonValue $Desired | ConvertTo-Json -Depth 20 -Compress
     return $currentJson -eq $desiredJson
+}
+
+function ConvertTo-CanonicalJsonValue {
+    param($Object)
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        $result = [ordered]@{}
+        $keys = [string[]]@($Object.Keys)
+        [System.Array]::Sort($keys, [System.StringComparer]::Ordinal)
+        foreach ($key in $keys) {
+            $result[$key] = ConvertTo-CanonicalJsonValue $Object[$key]
+        }
+        return $result
+    }
+
+    if ($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [string])) {
+        $items = @($Object)
+        $converted = [object[]]::new($items.Count)
+        for ($index = 0; $index -lt $items.Count; $index++) {
+            $converted[$index] = ConvertTo-CanonicalJsonValue $items[$index]
+        }
+        return ,$converted
+    }
+
+    return $Object
+}
+
+function Read-Utf8FileText {
+    param([Parameter(Mandatory)][string]$Path)
+
+    return [System.IO.File]::ReadAllText($Path, $StrictUtf8)
 }
 
 function New-UserOnlyWindowsAcl {
@@ -115,6 +147,16 @@ function Set-SecureFilePermissions {
     if ($LASTEXITCODE -ne 0) {
         throw "failed to restrict permissions on $Path"
     }
+}
+
+function Test-SecureFilePermissions {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ($IsWindowsPlatform) {
+        return $true
+    }
+
+    return [int]([System.IO.File]::GetUnixFileMode($Path)) -eq 384
 }
 
 function Write-SecureFileBytes {
@@ -201,7 +243,7 @@ function Merge-McpEntry {
     if ($hadFile) {
         Write-Info "Found existing $ConfigFile"
         try {
-            $existing = Get-Content -Raw -LiteralPath $ConfigFile |
+            $existing = Read-Utf8FileText -Path $ConfigFile |
                 ConvertFrom-Json -ErrorAction Stop |
                 ConvertTo-HashtableRecursive
         }
@@ -221,7 +263,24 @@ function Merge-McpEntry {
     }
 
     if ($null -ne $current -and (Test-EntriesEqual -Current $current -Desired $Entry)) {
-        Write-Ok "$Label is already configured in $ConfigFile"
+        $permissionsSecure = Test-SecureFilePermissions -Path $ConfigFile
+        if ($Check) {
+            if ($permissionsSecure) {
+                Write-Ok "$Label is already configured securely in $ConfigFile"
+            }
+            else {
+                Write-Warn2 "$Label is configured, but $ConfigFile permissions are not user-only; install would restrict them to mode 0600."
+            }
+            return
+        }
+
+        if (-not $permissionsSecure) {
+            Set-SecureFilePermissions -Path $ConfigFile
+            Write-Ok "$Label was already configured; restricted $ConfigFile to mode 0600"
+        }
+        else {
+            Write-Ok "$Label is already configured in $ConfigFile"
+        }
         return
     }
 
@@ -279,7 +338,7 @@ function Merge-McpEntry {
         $json = $existing | ConvertTo-Json -Depth 20
         $bytes = [System.Text.UTF8Encoding]::new($true).GetBytes($json)
         Write-SecureFileBytes -Path $tempFile -Bytes $bytes -WindowsAcl $originalWindowsAcl
-        Get-Content -Raw -LiteralPath $tempFile | ConvertFrom-Json -ErrorAction Stop | Out-Null
+        Read-Utf8FileText -Path $tempFile | ConvertFrom-Json -ErrorAction Stop | Out-Null
         Move-Item -LiteralPath $tempFile -Destination $ConfigFile -Force
         $configMoved = $true
         Set-SecureFilePermissions -Path $ConfigFile -WindowsAcl $originalWindowsAcl
