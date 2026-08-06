@@ -178,6 +178,7 @@ The gate performs local syntax and isolated config-merge tests only. It does not
 
 ## History
 
+- **2026-08-06** — added delegated OAuth installers for GitHub Copilot CLI, the GitHub Copilot app, and VS Code.
 - **2026-07-29** — `amn-ops-observability` plugin v1.2.0 shipped this OAuth-direct MCP config bundled with the observability skills.
 - **2026-07-30** — plugin v1.3.0 removed the MCP from the plugin. Skills stayed universal; the MCP moved here.
 - **Sibling repo**: [`AMNEngineering/newrelic-mcp-apim`](https://github.com/AMNEngineering/newrelic-mcp-apim) — same MCP, but authenticated via Entra bearer at APIM with a KV-injected NR key (no per-user NR token). For AMN engineers on the APIM Claude Code path.
