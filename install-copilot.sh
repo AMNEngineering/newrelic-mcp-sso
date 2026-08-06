@@ -133,6 +133,22 @@ confirm_replace() {
   esac
 }
 
+get_file_mode() {
+  local path=$1
+  local mode
+
+  if mode=$(stat -c '%a' "$path" 2>/dev/null); then
+    printf '%s' "$mode"
+    return 0
+  fi
+  if mode=$(stat -f '%Lp' "$path" 2>/dev/null); then
+    printf '%s' "$mode"
+    return 0
+  fi
+
+  return 1
+}
+
 merge_entry() {
   local cfg_file=$1
   local section=$2
@@ -162,7 +178,24 @@ merge_entry() {
   fi
 
   if [[ -n "$current" && "$current" == "$desired" ]]; then
-    ok "$label is already configured in $cfg_file"
+    local mode
+    if ! mode=$(get_file_mode "$cfg_file"); then
+      fail "could not inspect permissions on $cfg_file"
+      return 1
+    fi
+    if [[ "$mode" != "600" ]]; then
+      if [[ $CHECK_ONLY -eq 1 ]]; then
+        fail "$label is configured, but $cfg_file permissions are not user-only; install would restrict them to mode 0600."
+        return 1
+      fi
+      if ! chmod 600 "$cfg_file"; then
+        fail "failed to restrict permissions on $cfg_file"
+        return 1
+      fi
+      ok "$label was already configured; restricted $cfg_file to mode 0600"
+      return 0
+    fi
+    ok "$label is already configured securely in $cfg_file"
     return 0
   fi
 

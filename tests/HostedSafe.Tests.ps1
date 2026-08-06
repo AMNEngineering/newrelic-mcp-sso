@@ -394,6 +394,44 @@ Describe 'Bash Copilot installer' {
         Test-Path -LiteralPath (Join-Path $script:Workspace '.vscode/mcp.json') | Should -BeFalse
     }
 
+    It 'fails check and fixes unsafe permissions on an idempotent install' {
+        if ($script:IsWindowsHost) {
+            Set-ItResult -Skipped -Because 'Bash behavior runs in the Linux hosted-safe job'
+            return
+        }
+        $bash = Get-Command bash -ErrorAction SilentlyContinue
+        if (-not $bash) {
+            Set-ItResult -Skipped -Because 'bash is not installed'
+            return
+        }
+
+        New-Item -ItemType Directory -Path $script:CopilotHome -Force | Out-Null
+        $copilotConfig = Join-Path $script:CopilotHome 'mcp-config.json'
+        @'
+{
+  "mcpServers": {
+    "newrelic": {
+      "tools": ["*"],
+      "url": "https://mcp.newrelic.com/mcp/",
+      "type": "http"
+    }
+  }
+}
+'@ | Set-Content -LiteralPath $copilotConfig -Encoding utf8
+        & chmod 644 $copilotConfig
+        $LASTEXITCODE | Should -Be 0
+
+        $checkOutput = (& $bash.Source $script:BashInstaller `
+            --target copilot --check 2>&1) | Out-String
+        $LASTEXITCODE | Should -Not -Be 0
+        $checkOutput | Should -Match 'permissions are not user-only'
+        [int]([System.IO.File]::GetUnixFileMode($copilotConfig)) | Should -Be 420
+
+        & $bash.Source $script:BashInstaller --target copilot
+        $LASTEXITCODE | Should -Be 0
+        [int]([System.IO.File]::GetUnixFileMode($copilotConfig)) | Should -Be 384
+    }
+
     It 'creates exclusive mode 0600 backups without predictable overwrite' {
         if ($script:IsWindowsHost) {
             Set-ItResult -Skipped -Because 'Bash behavior runs in the Linux hosted-safe job'
