@@ -27,7 +27,7 @@ The Copilot installers use each supported client's native schema:
 | Surface | Configuration | Support |
 |---|---|---|
 | GitHub Copilot CLI | `~/.copilot/mcp-config.json` (`mcpServers`) | Supported. Native remote HTTP OAuth is discovered from the New Relic server. |
-| GitHub Copilot app | Imports the Copilot CLI user MCP configuration | Supported by the same `~/.copilot/mcp-config.json` entry. |
+| GitHub Copilot app | Imports the Copilot CLI user MCP configuration | Configuration is recognized, but active third-party OAuth host bugs can block New Relic authorization. Prefer CLI or VS Code until fixed. |
 | GitHub Copilot in VS Code | `<workspace>/.vscode/mcp.json` (`servers`) | Supported. VS Code opens a browser for New Relic OAuth on first connection. |
 
 Every installer backs up an existing destination before merging. The installers do **not** touch unrelated MCP servers or user-owned keys.
@@ -63,9 +63,9 @@ Or, from a local clone: `.\install.ps1`
 
 Both installers accept `-Check` / `--check` to validate + report without modifying anything.
 
-### GitHub Copilot app, CLI, and VS Code
+### GitHub Copilot CLI, app configuration, and VS Code
 
-The default configures the Copilot app and CLI for your user. VS Code is opt-in because it requires an explicit existing workspace.
+The default configures Copilot CLI for your user. The Copilot app imports that entry, although its current third-party OAuth host bugs can prevent New Relic sign-in. VS Code is opt-in because it requires an explicit existing workspace.
 
 **macOS / Linux:**
 
@@ -114,10 +114,10 @@ Use `--target all` / `-Target All` with the same workspace option to configure b
 
 ### Verify GitHub Copilot
 
-1. Restart Copilot CLI or the GitHub Copilot app.
-2. In Copilot CLI, run `copilot mcp get newrelic`. In the app, open **Settings → MCP Servers**.
-3. Ask Copilot to use a New Relic tool. Complete the separate New Relic → OneLogin browser flow.
-4. In VS Code, open the configured workspace, run **MCP: List Servers**, start `newrelic`, and complete the same New Relic OAuth flow.
+1. Restart Copilot CLI and run `copilot mcp get newrelic`.
+2. Ask Copilot CLI to use a New Relic tool. Complete the separate New Relic → OneLogin browser authorization.
+3. In VS Code, open the configured workspace, run **MCP: List Servers**, start `newrelic`, and complete the same separate New Relic OAuth flow.
+4. In the Copilot app, confirm the imported entry under **Settings → MCP Servers**. New Relic authorization may currently fail because of active third-party OAuth host bugs; use CLI or VS Code until that product issue is fixed.
 
 Do not provide Copilot's GitHub OAuth token to New Relic. It is a credential for a different resource and is not used by these installers.
 
@@ -140,6 +140,7 @@ Any browser session with New Relic can be revoked in the New Relic UI under Acco
 | Sign-in loops back to "needs authentication" | Try `claude mcp logout newrelic` then `claude mcp login newrelic`. |
 | Claude Code < v2.1.195 | Upgrade Claude Code — older versions can't discover the OAuth server via `/.well-known/oauth-protected-resource`. |
 | Copilot app does not show `newrelic` | Restart the app. The app imports MCP servers configured for Copilot CLI. |
+| Copilot app shows `newrelic` but authorization fails | The Desktop host has active third-party OAuth bugs. Use Copilot CLI or VS Code until the host issue is fixed. Do not substitute a GitHub token. |
 | Copilot CLI shows an OAuth error | Upgrade Copilot CLI, remove its cached `newrelic` OAuth state, and reconnect. The New Relic endpoint requires its own browser flow. |
 | VS Code does not show `newrelic` | Confirm the intended workspace contains `.vscode/mcp.json`, then run **MCP: List Servers**. |
 
@@ -154,7 +155,8 @@ Any browser session with New Relic can be revoked in the New Relic UI under Acco
 
 - **GitHub.com Copilot cloud agent and Copilot code review are not configured.** GitHub explicitly does not support remote MCP servers that use OAuth on those surfaces.
 - **GitHub.com Copilot Chat does not accept arbitrary user-configured remote MCP servers.**
-- **JetBrains, Xcode, and Eclipse are not automated here.** GitHub documents their GitHub MCP OAuth experience, but not a portable generic third-party OAuth configuration for New Relic.
+- **The GitHub Copilot app imports the CLI configuration, but active third-party OAuth host bugs can prevent the New Relic browser authorization from completing.** Use Copilot CLI or VS Code until fixed.
+- **JetBrains OAuth support remains experimental and is not automated here.** Xcode and Eclipse also lack a documented portable generic third-party OAuth contract for New Relic.
 - **Visual Studio is not automated here.** Visual Studio supports generic MCP OAuth, but New Relic's current official client setup documents VS Code, not a tested Visual Studio configuration.
 
 ## Tests
@@ -178,7 +180,7 @@ The gate performs local syntax and isolated config-merge tests only. It does not
 
 ## History
 
-- **2026-08-06** — added delegated OAuth installers for GitHub Copilot CLI, the GitHub Copilot app, and VS Code.
+- **2026-08-06** — added delegated OAuth installers for GitHub Copilot CLI and VS Code, plus the shared configuration imported by the GitHub Copilot app.
 - **2026-07-29** — `amn-ops-observability` plugin v1.2.0 shipped this OAuth-direct MCP config bundled with the observability skills.
 - **2026-07-30** — plugin v1.3.0 removed the MCP from the plugin. Skills stayed universal; the MCP moved here.
 - **Sibling repo**: [`AMNEngineering/newrelic-mcp-apim`](https://github.com/AMNEngineering/newrelic-mcp-apim) — same MCP, but authenticated via Entra bearer at APIM with a KV-injected NR key (no per-user NR token). For AMN engineers on the APIM Claude Code path.

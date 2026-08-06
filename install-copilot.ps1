@@ -3,9 +3,9 @@
 Adds the New Relic OAuth MCP to supported GitHub Copilot clients.
 
 .DESCRIPTION
-The Copilot target configures both Copilot CLI and the GitHub Copilot app,
-which imports user-level CLI MCP servers. The VS Code target writes the
-workspace MCP configuration used by GitHub Copilot agent mode.
+The Copilot target configures Copilot CLI. The GitHub Copilot app imports the
+same user-level config, but currently has known third-party OAuth host bugs.
+The VS Code target writes the workspace config used by Copilot agent mode.
 
 .PARAMETER Target
 Allowed values: All, Copilot, VSCode. Default: Copilot.
@@ -207,7 +207,7 @@ $vscodeEntry = [ordered]@{
 Write-Head 'New Relic MCP - GitHub Copilot OAuth install'
 
 if ($Target -in @('All', 'Copilot')) {
-    Merge-McpEntry -ConfigFile $copilotConfig -Section 'mcpServers' -Entry $copilotEntry -Label 'Copilot app + CLI'
+    Merge-McpEntry -ConfigFile $copilotConfig -Section 'mcpServers' -Entry $copilotEntry -Label 'Copilot CLI (shared with app)'
 }
 if ($Target -in @('All', 'VSCode')) {
     Merge-McpEntry -ConfigFile $vscodeConfig -Section 'servers' -Entry $vscodeEntry -Label 'VS Code GitHub Copilot'
@@ -221,7 +221,8 @@ if ($Check) {
 Write-Head 'Next steps'
 if ($Target -in @('All', 'Copilot')) {
     Write-Info "Copilot CLI: restart it, run 'copilot mcp get newrelic', then use a New Relic tool."
-    Write-Info 'Copilot app: restart it and confirm newrelic under Settings > MCP Servers.'
+    Write-Warn2 'Copilot app imports this entry, but active third-party OAuth host bugs may block sign-in.'
+    Write-Info 'If app authorization fails, use Copilot CLI or VS Code until the host bug is fixed.'
 }
 if ($Target -in @('All', 'VSCode')) {
     Write-Info "VS Code: reopen $Workspace, run 'MCP: List Servers', and start newrelic."

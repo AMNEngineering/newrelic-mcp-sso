@@ -253,5 +253,6 @@ Describe 'OAuth security contract' {
         $source | Should -Not -Match 'COPILOT_GITHUB_TOKEN'
         $source | Should -Not -Match 'Authorization\s*='
         $source | Should -Match 'separate New Relic'
+        $source | Should -Match 'third-party OAuth host bugs'
     }
 }

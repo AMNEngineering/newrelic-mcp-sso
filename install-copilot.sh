@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Add the New Relic OAuth MCP to GitHub Copilot clients.
 #
-# The Copilot target configures both Copilot CLI and the GitHub Copilot app,
-# which imports user-level CLI MCP servers. The VS Code target writes the
-# workspace MCP configuration used by GitHub Copilot agent mode.
+# The Copilot target configures Copilot CLI. The GitHub Copilot app imports the
+# same user-level config, but currently has known third-party OAuth host bugs.
+# The VS Code target writes the workspace config used by Copilot agent mode.
 
 set -euo pipefail
 
@@ -58,8 +58,8 @@ while (($#)); do
 install-copilot.sh - add New Relic MCP to supported GitHub Copilot clients.
 
 Usage:
-  install-copilot.sh                         Configure Copilot app and Copilot CLI.
-  install-copilot.sh --target copilot        Configure Copilot app and Copilot CLI.
+  install-copilot.sh                         Configure Copilot CLI (shared with the app).
+  install-copilot.sh --target copilot        Configure Copilot CLI (shared with the app).
   install-copilot.sh --target vscode         Configure VS Code for the current workspace.
   install-copilot.sh --workspace /path/repo  Choose the VS Code workspace.
   install-copilot.sh --check                 Validate and report without modifying files.
@@ -214,7 +214,7 @@ head "New Relic MCP - GitHub Copilot OAuth install"
 
 case "$TARGET" in
   all|copilot)
-    merge_entry "$COPILOT_CFG" "mcpServers" "$COPILOT_ENTRY" "Copilot app + CLI"
+    merge_entry "$COPILOT_CFG" "mcpServers" "$COPILOT_ENTRY" "Copilot CLI (shared with app)"
     ;;
 esac
 
@@ -233,7 +233,8 @@ head "Next steps"
 case "$TARGET" in
   all|copilot)
     info "Copilot CLI: restart it, run 'copilot mcp get newrelic', then use a New Relic tool."
-    info "Copilot app: restart it and confirm newrelic under Settings > MCP Servers."
+    warn "Copilot app imports this entry, but active third-party OAuth host bugs may block sign-in."
+    info "If app authorization fails, use Copilot CLI or VS Code until the host bug is fixed."
     ;;
 esac
 case "$TARGET" in
