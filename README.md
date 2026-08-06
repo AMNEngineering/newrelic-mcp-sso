@@ -28,11 +28,12 @@ The Copilot installers use each supported client's native schema:
 |---|---|---|
 | GitHub Copilot CLI | `~/.copilot/mcp-config.json` (`mcpServers`) | Supported. Native remote HTTP OAuth is discovered from the New Relic server. |
 | GitHub Copilot app | Imports the Copilot CLI user MCP configuration | Configuration is recognized, but active third-party OAuth host bugs can block New Relic authorization. Prefer CLI or VS Code until fixed. |
-| GitHub Copilot in VS Code | `<workspace>/.vscode/mcp.json` (`servers`) | Supported. VS Code opens a browser for New Relic OAuth on first connection. |
+| VS Code Agent Host | Reads `~/.copilot/mcp-config.json` (`mcpServers`) natively | Supported by the same portable URL-only user configuration as Copilot CLI. |
+| GitHub Copilot in a VS Code workspace | `<workspace>/.vscode/mcp.json` (`servers`) | Supported. VS Code forwards this workspace configuration to Agent Host and opens a browser for New Relic OAuth on first connection. |
 
 Every installer backs up an existing destination before merging. The installers do **not** touch unrelated MCP servers or user-owned keys.
 
-The Copilot configuration intentionally contains no `Authorization` header, GitHub token, New Relic API key, client secret, or stored bearer token. Copilot's GitHub login authenticates Copilot only; New Relic starts its own delegated OAuth flow and stores its resulting credentials through the client's credential storage.
+The Copilot configuration intentionally contains no `Authorization` header, GitHub token, New Relic API key, client secret, or stored bearer token. Copilot's GitHub login authenticates Copilot only. New Relic starts its own delegated OAuth/DCR flow and issues a **separate New Relic OAuth access/refresh token** for the New Relic MCP resource; the client manages that credential through its credential storage.
 
 ## Prerequisites
 
@@ -63,9 +64,9 @@ Or, from a local clone: `.\install.ps1`
 
 Both installers accept `-Check` / `--check` to validate + report without modifying anything.
 
-### GitHub Copilot CLI, app configuration, and VS Code
+### GitHub Copilot CLI, app configuration, and VS Code Agent Host
 
-The default configures Copilot CLI for your user. The Copilot app imports that entry, although its current third-party OAuth host bugs can prevent New Relic sign-in. VS Code is opt-in because it requires an explicit existing workspace.
+The default writes the portable user configuration read natively by Copilot CLI and VS Code Agent Host. The Copilot app also imports that entry, although its current third-party OAuth host bugs can prevent New Relic sign-in. A repository-scoped VS Code configuration is opt-in because it requires an explicit existing workspace.
 
 **macOS / Linux:**
 
@@ -115,8 +116,8 @@ Use `--target all` / `-Target All` with the same workspace option to configure b
 ### Verify GitHub Copilot
 
 1. Restart Copilot CLI and run `copilot mcp get newrelic`.
-2. Ask Copilot CLI to use a New Relic tool. Complete the separate New Relic → OneLogin browser authorization.
-3. In VS Code, open the configured workspace, run **MCP: List Servers**, start `newrelic`, and complete the same separate New Relic OAuth flow.
+2. Ask Copilot CLI to use a New Relic tool. Complete the separate New Relic → OneLogin browser authorization. New Relic issues its own OAuth access/refresh token; it does not receive or reuse the Copilot GitHub token.
+3. In VS Code Agent Host, the user-level entry is available automatically. For a configured workspace, run **MCP: List Servers**, start `newrelic`, and complete the same separate New Relic OAuth flow.
 4. In the Copilot app, confirm the imported entry under **Settings → MCP Servers**. New Relic authorization may currently fail because of active third-party OAuth host bugs; use CLI or VS Code until that product issue is fixed.
 
 Do not provide Copilot's GitHub OAuth token to New Relic. It is a credential for a different resource and is not used by these installers.
@@ -148,7 +149,8 @@ Any browser session with New Relic can be revoked in the New Relic UI under Acco
 
 - **Per-user RBAC.** Every action attributes to *your* NR user identity and is bounded by *your* NR role. A read-only role gets read-only access, automatically.
 - **No shared key.** Tokens are session-scoped, revocable from the NR UI at any time.
-- **No token in MCP config.** OAuth tokens are managed by the client credential store, not written by these installers. Copilot CLI documents a local fallback under `~/.copilot/mcp-oauth-config/` only when keychain-backed storage is unavailable.
+- **Separate New Relic token.** New Relic's OAuth/DCR flow issues a New Relic access/refresh token for the MCP resource. It is distinct from the GitHub OAuth token used to authenticate Copilot.
+- **No token in MCP config.** The separate New Relic OAuth token is managed by the client credential store, not written by these installers. Copilot CLI documents a local fallback under `~/.copilot/mcp-oauth-config/` only when keychain-backed storage is unavailable.
 - **Separate trust domains.** GitHub/Copilot authentication is never reused as New Relic authorization.
 
 ## GitHub Copilot product limitations
